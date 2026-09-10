@@ -302,7 +302,10 @@ std::string Client::GetBaseUrl() const
   return ss.str();
 }
 
-Client::HttpResponse Client::Request(const std::string& method, const std::string& endpoint, const std::string& jsonBody)
+Client::HttpResponse Client::Request(const std::string& method,
+                                     const std::string& endpoint,
+                                     const std::string& jsonBody,
+                                     bool retryAuth)
 {
   HttpResponse resp;
   std::string url = GetBaseUrl() + endpoint;
@@ -369,6 +372,18 @@ Client::HttpResponse Client::Request(const std::string& method, const std::strin
   
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
+
+  // If Dispatcharr rejects the cached access token, obtain a new one and retry
+  // the request exactly once.
+  if (resp.statusCode == 401 && retryAuth && !m_accessToken.empty())
+  {
+    kodi::Log(ADDON_LOG_INFO,
+              "pvr.dispatcharr: Access token rejected; re-authenticating and retrying request");
+    m_accessToken.clear();
+
+    if (EnsureToken())
+      return Request(method, endpoint, jsonBody, false);
+  }
   
   return resp;
 }
@@ -385,7 +400,6 @@ bool Client::EnsureToken()
   std::string url = GetBaseUrl() + "/api/accounts/token/";
   kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: EnsureToken - URL: %s", url.c_str());
   kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: EnsureToken - Username: %s", m_settings.username.c_str());
-  kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: EnsureToken - POST body: %s", jsonBody.c_str());
   
   // Use libcurl directly for authentication
   CURL* curl = curl_easy_init();
@@ -419,7 +433,6 @@ bool Client::EnsureToken()
     
     kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: EnsureToken - HTTP code: %ld", httpCode);
     kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: EnsureToken - Response body length: %zu", responseBody.size());
-    kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: EnsureToken - Response body (first 500 chars): %s", responseBody.substr(0, 500).c_str());
     
     if (httpCode == 200) {
       std::string token;
@@ -705,13 +718,47 @@ bool Client::FetchRecordings(std::vector<Recording>& outRecordings)
           r.status = "scheduled";
       }
       
-      // Stream URL
-      // /api/channels/recordings/{id}/file/
-      r.streamUrl = GetBaseUrl() + "/api/channels/recordings/" + std::to_string(r.id) + "/file/";
-      
       outRecordings.push_back(r);
     }
   });
+  return true;
+}
+
+bool Client::GetRecordingStreamUrl(int id, std::string& outUrl)
+{
+  outUrl.clear();
+
+  // Refresh the recording list first. Besides confirming that the recording
+  // still exists, this makes an authenticated request and therefore exercises
+  // Request()'s 401 re-authentication path if the cached access token expired.
+  std::vector<Recording> recordings;
+  if (!FetchRecordings(recordings))
+    return false;
+
+  const auto it = std::find_if(
+      recordings.begin(), recordings.end(),
+      [id](const Recording& recording) { return recording.id == id; });
+
+  if (it == recordings.end())
+  {
+    kodi::Log(ADDON_LOG_WARNING,
+              "pvr.dispatcharr: Recording %d not found", id);
+    return false;
+  }
+
+  if (m_accessToken.empty())
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "pvr.dispatcharr: Cannot create recording playback URL without authentication");
+    return false;
+  }
+
+  // Dispatcharr's recording file endpoint accepts JWT authentication through
+  // the `token` query parameter for clients that cannot attach Authorization
+  // headers to media requests.
+  outUrl = GetBaseUrl() + "/api/channels/recordings/" +
+           std::to_string(id) + "/file/?token=" + m_accessToken;
+
   return true;
 }
 

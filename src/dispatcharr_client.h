@@ -43,7 +43,6 @@ struct Recording
   int channelId = 0;
   std::string title;
   std::string plot;
-  std::string streamUrl;
   std::string status;  // "scheduled", "recording", "completed", "interrupted"
   std::string iconPath; // poster_url from custom_properties
   time_t startTime = 0;
@@ -91,6 +90,7 @@ public:
 
   // Recordings
   bool FetchRecordings(std::vector<Recording>& outRecordings);
+  bool GetRecordingStreamUrl(int id, std::string& outUrl);
   bool DeleteRecording(int id);
   bool ScheduleRecording(int channelId, time_t startTime, time_t endTime, const std::string& title);
 
@@ -107,7 +107,10 @@ private:
     std::string body;
   };
   
-  HttpResponse Request(const std::string& method, const std::string& endpoint, const std::string& jsonBody = "");
+  HttpResponse Request(const std::string& method,
+                       const std::string& endpoint,
+                       const std::string& jsonBody = "",
+                       bool retryAuth = true);
   std::string GetBaseUrl() const;
   bool EnsureChannelMapping();
 };
