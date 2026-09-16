@@ -1609,12 +1609,24 @@ public:
   bool CanSeekStream() override
   {
     if (m_activeRecordedStream && m_activeRecordedStream->IsOpen())
+    {
+      kodi::Log(ADDON_LOG_DEBUG, "CanSeekStream: true (activeRecordedStream)");
       return true;
+    }
     if (m_activeNativeLiveCatchupStream && m_activeNativeLiveCatchupStream->IsOpen())
+    {
+      kodi::Log(ADDON_LOG_DEBUG, "CanSeekStream: true (activeNativeLiveCatchupStream)");
       return true;
+    }
     // Catchup streams support seeking via HTTP range requests
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_activeCatchupChannelUid != 0 && m_activeCatchup.programStart > 0;
+    const bool result = m_activeCatchupChannelUid != 0 && m_activeCatchup.programStart > 0;
+    kodi::Log(ADDON_LOG_DEBUG,
+              "CanSeekStream: %s (fallback; activeNativeLiveCatchupStream=%p activeRecordedStream=%p)",
+              result ? "true" : "false",
+              static_cast<void*>(m_activeNativeLiveCatchupStream.get()),
+              static_cast<void*>(m_activeRecordedStream.get()));
+    return result;
   }
 
   bool CanPauseStream() override
