@@ -89,13 +89,32 @@ struct EpgProgram
 
 // A native catch-up (time-shift) playback session, created per-programme via
 // POST /api/catchup/sessions/. playbackUrl already carries the session_id and
-// is playable as-is; seeking is done with plain HTTP Range requests, no
-// ffmpegdirect timezone-shift template required.
+// is playable as-is.
+//
+// NOTE: the proxy supports real HTTP Range seeking on this URL (verified
+// directly against the server), but Kodi's built-in ffmpeg demuxer seeking
+// on raw MPEG-TS does a slow PCR/PTS binary search and can leave audio
+// desynced after landing mid-stream. CreateCatchupUrls() below is the
+// seek-safe path: same session_id, reopened with a new `start` per seek via
+// inputstream.ffmpegdirect, same as the Xtream catchup path.
 struct CatchupSession
 {
   std::string sessionId;
   std::string playbackUrl;
   time_t expiresAt = 0;
+};
+
+// URLs for driving native catch-up via inputstream.ffmpegdirect's catchup
+// stream_mode: defaultUrl is the concrete URL for the initial open;
+// templateUrl carries ffmpegdirect's {Y}-{m}-{d}:{H}-{M} placeholders (same
+// syntax the Xtream catchup template uses) in its `start` query param, which
+// it substitutes and re-requests (same session_id, new `start`) on each seek
+// - confirmed server-side to correctly re-anchor rather than serve stale
+// pooled bytes, as long as session_id is present on every request.
+struct CatchupUrls
+{
+  std::string defaultUrl;
+  std::string templateUrl;
 };
 
 class Client
@@ -132,6 +151,15 @@ public:
                             int durationMinutes,
                             CatchupSession& outSession);
   bool DeleteCatchupSession(const std::string& sessionId);
+
+  // Mints a session (as CreateCatchupSession) and builds the ffmpegdirect
+  // default/template URL pair from it. programStart/durationMinutes are the
+  // initial position only - ffmpegdirect drives all subsequent seeks itself
+  // via templateUrl.
+  bool CreateCatchupUrls(const std::string& channelUuid,
+                         time_t programStart,
+                         int durationMinutes,
+                         CatchupUrls& outUrls);
 
   // Series Rules (Season Pass)
   bool FetchSeriesRules(std::vector<SeriesRule>& outRules);

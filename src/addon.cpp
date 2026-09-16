@@ -1721,30 +1721,76 @@ public:
           if (!dispatchClient)
             return PVR_ERROR_SERVER_ERROR;
 
+          // Kodi's built-in ffmpeg demuxer can issue real HTTP Range seeks
+          // against the native catch-up proxy (verified directly against the
+          // server), but landing mid-MPEG-TS via a byte-search seek leaves
+          // audio desynced in practice. inputstream.ffmpegdirect avoids that
+          // by reopening the stream at a new `start` per seek instead of
+          // seeking within one connection - same technique the Xtream
+          // catchup path already uses, just against Dispatcharr's own
+          // catch-up proxy URL (session_id stays constant; only `start`
+          // changes, which the server correctly re-anchors to per-request).
           const int durationMinutes = std::max(1, static_cast<int>((effectiveEnd - startTime) / 60));
-          dispatcharr::CatchupSession session;
-          if (!dispatchClient->CreateCatchupSession(stream.uuid, startTime, durationMinutes, session))
+          dispatcharr::CatchupUrls urls;
+          if (!dispatchClient->CreateCatchupUrls(stream.uuid, startTime, durationMinutes, urls))
           {
             kodi::Log(ADDON_LOG_ERROR, "GetEPGTagStreamProperties: native catch-up session creation failed");
             return PVR_ERROR_UNKNOWN;
           }
 
-          kodi::Log(ADDON_LOG_INFO, "GetEPGTagStreamProperties: native catchup playback_url = %s",
-                    session.playbackUrl.c_str());
+          kodi::Log(ADDON_LOG_INFO, "GetEPGTagStreamProperties: native catchup default_url = %s",
+                    urls.defaultUrl.c_str());
 
           const auto nowSteady = std::chrono::steady_clock::now();
           const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     nowSteady.time_since_epoch()).count();
           {
             std::lock_guard<std::mutex> lock(m_mutex);
-            // Native catch-up seeks via plain HTTP Range on the session URL -
-            // no ffmpegdirect timezone-shift template needed.
             m_pendingCatchupByChannel[channelUid] = PendingCatchup{
-              session.playbackUrl, "", nowMs + 30000, startTime, effectiveEnd, startTime, false
+              urls.defaultUrl, urls.templateUrl, nowMs + 30000, startTime, effectiveEnd, startTime, true
             };
           }
 
-          properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, session.playbackUrl);
+          properties.emplace_back(PVR_STREAM_PROPERTY_INPUTSTREAM, "inputstream.ffmpegdirect");
+          properties.emplace_back("inputstream-player", "videodefaultplayer");
+          properties.emplace_back("inputstream.ffmpegdirect.stream_mode", "catchup");
+          properties.emplace_back("inputstream.ffmpegdirect.default_url", urls.defaultUrl);
+          properties.emplace_back("inputstream.ffmpegdirect.catchup_url_format_string", urls.templateUrl);
+          properties.emplace_back("inputstream.ffmpegdirect.catchup_buffer_start_time", std::to_string(startTime));
+          properties.emplace_back("inputstream.ffmpegdirect.catchup_buffer_end_time", std::to_string(effectiveEnd));
+          if (isOngoing)
+          {
+            properties.emplace_back("inputstream.ffmpegdirect.catchup_terminates", "false");
+            properties.emplace_back("inputstream.ffmpegdirect.is_realtime_stream", "false");
+          }
+          else
+          {
+            properties.emplace_back("inputstream.ffmpegdirect.catchup_terminates", "true");
+            properties.emplace_back("inputstream.ffmpegdirect.is_realtime_stream", "false");
+          }
+
+          // Same UTC-compensation dance the Xtream ffmpegdirect path uses:
+          // ffmpegdirect calls SafeLocaltime() on the seek target before
+          // substituting {Y}/{m}/{d}/{H}/{M}, so a positive local-UTC offset
+          // is passed here to be subtracted first, netting out to UTC.
+          {
+            time_t nowUtcProbe = std::time(nullptr);
+            std::tm utcTm = {};
+            std::tm localTm = {};
+#ifdef _WIN32
+            gmtime_s(&utcTm, &nowUtcProbe);
+            localtime_s(&localTm, &nowUtcProbe);
+#else
+            gmtime_r(&nowUtcProbe, &utcTm);
+            localtime_r(&nowUtcProbe, &localTm);
+#endif
+            const time_t utcTime = timegm(&utcTm);
+            const time_t localAsUtc = timegm(&localTm);
+            const int timezoneOffsetSecs = static_cast<int>(localAsUtc - utcTime);
+            properties.emplace_back("inputstream.ffmpegdirect.timezone_shift", std::to_string(timezoneOffsetSecs));
+          }
+
+          properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, urls.defaultUrl);
           properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
           properties.emplace_back(PVR_STREAM_PROPERTY_EPGPLAYBACKASLIVE, "false");
           properties.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE, "video/mp2t");

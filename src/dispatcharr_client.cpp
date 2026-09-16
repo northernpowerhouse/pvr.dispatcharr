@@ -865,6 +865,27 @@ bool Client::DeleteCatchupSession(const std::string& sessionId)
   return success;
 }
 
+bool Client::CreateCatchupUrls(const std::string& channelUuid,
+                               time_t programStart,
+                               int durationMinutes,
+                               CatchupUrls& outUrls)
+{
+  CatchupSession session;
+  if (!CreateCatchupSession(channelUuid, programStart, durationMinutes, session))
+    return false;
+
+  const std::string base = GetBaseUrl() + "/proxy/catchup/" + channelUuid +
+      "?session_id=" + session.sessionId + "&token=" + m_accessToken + "&start=";
+
+  outUrls.defaultUrl = base + TimeToIso(programStart);
+  // ffmpegdirect substitutes {Y}/{m}/{d}/{H}/{M} with the seek target's
+  // date/time components (same placeholder syntax as the Xtream catchup
+  // template) and re-requests this URL - same session_id, new `start` -
+  // on every seek.
+  outUrls.templateUrl = base + "{Y}-{m}-{d}T{H}:{M}:00Z";
+  return true;
+}
+
 bool Client::EnsureChannelMapping()
 {
   if (!m_channelNumberToDispatchId.empty()) return true;
