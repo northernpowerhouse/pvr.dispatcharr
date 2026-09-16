@@ -1645,10 +1645,15 @@ public:
     if (m_activeRecordedStream && m_activeRecordedStream->IsOpen())
       return false;
     if (m_activeNativeLiveCatchupStream && m_activeNativeLiveCatchupStream->IsOpen())
+    {
+      kodi::Log(ADDON_LOG_DEBUG, "IsRealTimeStream: false (activeNativeLiveCatchupStream)");
       return false;
+    }
     // When playing catchup, this is NOT a realtime stream
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_activeCatchupChannelUid == 0;
+    const bool result = m_activeCatchupChannelUid == 0;
+    kodi::Log(ADDON_LOG_DEBUG, "IsRealTimeStream: %s (fallback)", result ? "true" : "false");
+    return result;
   }
 
   PVR_ERROR GetStreamTimes(kodi::addon::PVRStreamTimes& times) override
