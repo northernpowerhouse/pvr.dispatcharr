@@ -1315,11 +1315,19 @@ public:
 
       // A pending native catchup open (stashed by GetEPGTagStreamProperties)
       // selects Kodi's raw OpenLiveStream/ReadLiveStream/SeekLiveStream path:
-      // return empty properties (no STREAMURL) and leave the entry for
-      // OpenLiveStream to consume.
+      // return no STREAMURL and leave the entry for OpenLiveStream to
+      // consume. ISREALTIMESTREAM=false is required here (confirmed - Kodi
+      // refused Player.Seek with -32100 "Failed to execute method" and never
+      // even reached SeekLiveStream when it was omitted, despite
+      // CanSeekStream() returning true): it's apparently the signal Kodi
+      // uses to allow seeking on a channel-based open at all, separate from
+      // the CanSeekStream()/IsRealTimeStream() overrides.
       const auto nativeIt = m_pendingNativeCatchupOpenByChannel.find(channelUid);
       if (nativeIt != m_pendingNativeCatchupOpenByChannel.end() && nativeIt->second.expiresAtMs >= nowMs)
+      {
+        properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
         return PVR_ERROR_NO_ERROR;
+      }
 
       uidToStream = m_uidToStreamId;
       streams = m_streams;
@@ -1832,6 +1840,7 @@ public:
           }
           (void)isOngoing;
           properties.emplace_back(PVR_STREAM_PROPERTY_EPGPLAYBACKASLIVE, "true");
+          properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
           return PVR_ERROR_NO_ERROR;
         }
 
