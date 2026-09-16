@@ -94,27 +94,23 @@ struct EpgProgram
 // NOTE: the proxy supports real HTTP Range seeking on this URL (verified
 // directly against the server), but Kodi's built-in ffmpeg demuxer seeking
 // on raw MPEG-TS does a slow PCR/PTS binary search and can leave audio
-// desynced after landing mid-stream. CreateCatchupUrls() below is the
-// seek-safe path: same session_id, reopened with a new `start` per seek via
-// inputstream.ffmpegdirect, same as the Xtream catchup path.
+// desynced after landing mid-stream. Worse, reusing this same session_id
+// with a different `start` to reopen elsewhere (e.g. via
+// inputstream.ffmpegdirect's catchup_url_format_string) is silently ignored
+// by the server - confirmed directly against Dispatcharr with curl, not
+// just observed in Kodi: a repeated identical `start` and a `start` 40
+// minutes later both returned byte-identical content on the same
+// session_id. The only thing that reliably re-anchors is a genuinely new
+// session via CreateCatchupSession. See NativeCatchupLiveStream
+// (src/recording/native_catchup_live_stream.h) for the addon-managed seek
+// path this drives: it mints a fresh session per real seek and serves it
+// through Kodi's OpenLiveStream/ReadLiveStream/SeekLiveStream byte-callback
+// interface instead of a client-side URL.
 struct CatchupSession
 {
   std::string sessionId;
   std::string playbackUrl;
   time_t expiresAt = 0;
-};
-
-// URLs for driving native catch-up via inputstream.ffmpegdirect's catchup
-// stream_mode: defaultUrl is the concrete URL for the initial open;
-// templateUrl carries ffmpegdirect's {Y}-{m}-{d}:{H}-{M} placeholders (same
-// syntax the Xtream catchup template uses) in its `start` query param, which
-// it substitutes and re-requests (same session_id, new `start`) on each seek
-// - confirmed server-side to correctly re-anchor rather than serve stale
-// pooled bytes, as long as session_id is present on every request.
-struct CatchupUrls
-{
-  std::string defaultUrl;
-  std::string templateUrl;
 };
 
 class Client
@@ -152,14 +148,18 @@ public:
                             CatchupSession& outSession);
   bool DeleteCatchupSession(const std::string& sessionId);
 
-  // Mints a session (as CreateCatchupSession) and builds the ffmpegdirect
-  // default/template URL pair from it. programStart/durationMinutes are the
-  // initial position only - ffmpegdirect drives all subsequent seeks itself
-  // via templateUrl.
-  bool CreateCatchupUrls(const std::string& channelUuid,
-                         time_t programStart,
-                         int durationMinutes,
-                         CatchupUrls& outUrls);
+  // Fetches [offset, offset+length) of a catch-up session's stream via HTTP
+  // Range, authenticated with the same Bearer header (and auth-retry) as
+  // every other Request() call - no ?token= query param needed here, unlike
+  // BuildLiveStreamUrl which hands a bare URL to Kodi with no way to send
+  // custom headers. outTotalLength reports the session's full size from the
+  // server's Content-Range response.
+  bool FetchCatchupStreamRange(const std::string& channelUuid,
+                               const std::string& sessionId,
+                               int64_t offset,
+                               int64_t length,
+                               std::string& outData,
+                               int64_t& outTotalLength);
 
   // Series Rules (Season Pass)
   bool FetchSeriesRules(std::vector<SeriesRule>& outRules);

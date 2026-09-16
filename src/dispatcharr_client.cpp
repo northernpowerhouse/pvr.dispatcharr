@@ -865,24 +865,39 @@ bool Client::DeleteCatchupSession(const std::string& sessionId)
   return success;
 }
 
-bool Client::CreateCatchupUrls(const std::string& channelUuid,
-                               time_t programStart,
-                               int durationMinutes,
-                               CatchupUrls& outUrls)
+bool Client::FetchCatchupStreamRange(const std::string& channelUuid,
+                                     const std::string& sessionId,
+                                     int64_t offset,
+                                     int64_t length,
+                                     std::string& outData,
+                                     int64_t& outTotalLength)
 {
-  CatchupSession session;
-  if (!CreateCatchupSession(channelUuid, programStart, durationMinutes, session))
+  outData.clear();
+  outTotalLength = 0;
+  if (length <= 0) return false;
+  if (!EnsureToken()) return false;
+
+  std::ostringstream range;
+  range << "bytes=" << offset << "-" << (offset + length - 1);
+  const auto response = Request(
+      "GET", "/proxy/catchup/" + channelUuid + "?session_id=" + sessionId, "", true, range.str());
+  if (response.statusCode != 200 && response.statusCode != 206)
     return false;
 
-  const std::string base = GetBaseUrl() + "/proxy/catchup/" + channelUuid +
-      "?session_id=" + session.sessionId + "&token=" + m_accessToken + "&start=";
+  const size_t headerPos = response.headers.find("Content-Range:");
+  if (headerPos != std::string::npos)
+  {
+    const size_t slash = response.headers.find('/', headerPos);
+    if (slash != std::string::npos)
+    {
+      try { outTotalLength = std::stoll(response.headers.substr(slash + 1)); }
+      catch (...) { outTotalLength = 0; }
+    }
+  }
+  if (outTotalLength <= 0)
+    outTotalLength = static_cast<int64_t>(response.body.size());
 
-  outUrls.defaultUrl = base + TimeToIso(programStart);
-  // ffmpegdirect substitutes {Y}/{m}/{d}/{H}/{M} with the seek target's
-  // date/time components (same placeholder syntax as the Xtream catchup
-  // template) and re-requests this URL - same session_id, new `start` -
-  // on every seek.
-  outUrls.templateUrl = base + "{Y}-{m}-{d}T{H}:{M}:00Z";
+  outData = std::move(response.body);
   return true;
 }
 

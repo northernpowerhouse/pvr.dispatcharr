@@ -24,6 +24,7 @@
 #include "dispatcharr_client.h"
 #include "recording/growing_recorded_stream.h"
 #include "recording/remote_file_recorded_stream.h"
+#include "recording/native_catchup_live_stream.h"
 #include "recording/epg_recording_match.h"
 
 // Platform-specific time functions
@@ -537,8 +538,13 @@ public:
     // EPG support via XMLTV from Xtream Codes server
     capabilities.SetSupportsEPG(true);
 
-    // We provide stream URLs and let Kodi handle playback.
-    capabilities.SetHandlesInputStream(false);
+    // Regular live/recording playback provides a STREAMURL and lets Kodi
+    // handle it as usual. This capability only additionally enables
+    // OpenLiveStream/ReadLiveStream/SeekLiveStream/LengthLiveStream as an
+    // opt-in per-stream alternative - selected only for native catchup (see
+    // GetEPGTagStreamProperties/GetChannelStreamProperties), which returns
+    // no STREAMURL specifically to route into that path instead.
+    capabilities.SetHandlesInputStream(true);
 
     // DVR/Recording support via Dispatcharr backend
     capabilities.SetSupportsRecordings(true);
@@ -1303,14 +1309,23 @@ public:
     bool hasPendingCatchup = false;
     {
       std::lock_guard<std::mutex> lock(m_mutex);
+      const unsigned int channelUid = channel.GetUniqueId();
+      const auto now = std::chrono::steady_clock::now();
+      const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+
+      // A pending native catchup open (stashed by GetEPGTagStreamProperties)
+      // selects Kodi's raw OpenLiveStream/ReadLiveStream/SeekLiveStream path:
+      // return empty properties (no STREAMURL) and leave the entry for
+      // OpenLiveStream to consume.
+      const auto nativeIt = m_pendingNativeCatchupOpenByChannel.find(channelUid);
+      if (nativeIt != m_pendingNativeCatchupOpenByChannel.end() && nativeIt->second.expiresAtMs >= nowMs)
+        return PVR_ERROR_NO_ERROR;
+
       uidToStream = m_uidToStreamId;
       streams = m_streams;
       settings = m_xtreamSettings;
       streamFormat = m_streamFormat;
       // Check if there's a pending catchup URL for this channel
-      const unsigned int channelUid = channel.GetUniqueId();
-      const auto now = std::chrono::steady_clock::now();
-      const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
       auto pendingIt = m_pendingCatchupByChannel.find(channelUid);
       if (pendingIt != m_pendingCatchupByChannel.end())
       {
@@ -1587,6 +1602,8 @@ public:
   {
     if (m_activeRecordedStream && m_activeRecordedStream->IsOpen())
       return true;
+    if (m_activeNativeLiveCatchupStream && m_activeNativeLiveCatchupStream->IsOpen())
+      return true;
     // Catchup streams support seeking via HTTP range requests
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_activeCatchupChannelUid != 0 && m_activeCatchup.programStart > 0;
@@ -1594,7 +1611,8 @@ public:
 
   bool CanPauseStream() override
   {
-    return m_activeRecordedStream && m_activeRecordedStream->IsOpen();
+    return (m_activeRecordedStream && m_activeRecordedStream->IsOpen()) ||
+           (m_activeNativeLiveCatchupStream && m_activeNativeLiveCatchupStream->IsOpen());
   }
 
   void PauseStream(bool paused) override
@@ -1605,6 +1623,8 @@ public:
   bool IsRealTimeStream() override
   {
     if (m_activeRecordedStream && m_activeRecordedStream->IsOpen())
+      return false;
+    if (m_activeNativeLiveCatchupStream && m_activeNativeLiveCatchupStream->IsOpen())
       return false;
     // When playing catchup, this is NOT a realtime stream
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -1650,13 +1670,72 @@ public:
     return PVR_ERROR_NOT_IMPLEMENTED;
   }
 
+  // Only ever selected for native catchup - see the "pending native catchup
+  // open" checks in GetChannelStreamProperties/GetEPGTagStreamProperties
+  // above. Regular live channel playback (any api_mode) always returns a
+  // STREAMURL and never reaches OpenLiveStream/ReadLiveStream/SeekLiveStream/
+  // LengthLiveStream at all.
+  bool OpenLiveStream(const kodi::addon::PVRChannel& channel) override
+  {
+    PendingNativeCatchupOpen pending;
+    bool hasPending = false;
+    std::shared_ptr<dispatcharr::Client> dispatchClient;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      const unsigned int channelUid = channel.GetUniqueId();
+      const auto now = std::chrono::steady_clock::now();
+      const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+      auto it = m_pendingNativeCatchupOpenByChannel.find(channelUid);
+      if (it != m_pendingNativeCatchupOpenByChannel.end())
+      {
+        if (it->second.expiresAtMs >= nowMs)
+        {
+          pending = it->second;
+          hasPending = true;
+        }
+        m_pendingNativeCatchupOpenByChannel.erase(it);
+      }
+      dispatchClient = m_dispatcharrClient;
+    }
+
+    if (!hasPending || !dispatchClient)
+      return false;
+
+    auto stream = std::make_unique<dispatcharr::recording::NativeCatchupLiveStream>(*dispatchClient);
+    if (!stream->Open(pending.channelUuid, pending.programStart, pending.programEnd))
+      return false;
+
+    m_activeNativeLiveCatchupStream = std::move(stream);
+    return true;
+  }
+
   void CloseLiveStream() override
   {
+    if (m_activeNativeLiveCatchupStream)
+    {
+      m_activeNativeLiveCatchupStream->Close();
+      m_activeNativeLiveCatchupStream.reset();
+    }
     std::lock_guard<std::mutex> lock(m_mutex);
     // Clear all active stream state that may differ between channels
     m_activeCatchup = PendingCatchup{};
     m_activeCatchupChannelUid = 0;
     kodi::Log(ADDON_LOG_DEBUG, "CloseLiveStream: cleared active stream state");
+  }
+
+  int ReadLiveStream(unsigned char* buffer, unsigned int size) override
+  {
+    return m_activeNativeLiveCatchupStream ? m_activeNativeLiveCatchupStream->Read(buffer, size) : -1;
+  }
+
+  int64_t SeekLiveStream(int64_t position, int whence) override
+  {
+    return m_activeNativeLiveCatchupStream ? m_activeNativeLiveCatchupStream->Seek(position, whence) : -1;
+  }
+
+  int64_t LengthLiveStream() override
+  {
+    return m_activeNativeLiveCatchupStream ? m_activeNativeLiveCatchupStream->Length() : -1;
   }
 
   PVR_ERROR GetEPGTagStreamProperties(const kodi::addon::PVREPGTag& tag,
@@ -1713,87 +1792,28 @@ public:
           if (stream.uuid.empty())
             return PVR_ERROR_UNKNOWN;
 
-          std::shared_ptr<dispatcharr::Client> dispatchClient;
-          {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            dispatchClient = m_dispatcharrClient;
-          }
-          if (!dispatchClient)
-            return PVR_ERROR_SERVER_ERROR;
-
-          // Kodi's built-in ffmpeg demuxer can issue real HTTP Range seeks
-          // against the native catch-up proxy (verified directly against the
-          // server), but landing mid-MPEG-TS via a byte-search seek leaves
-          // audio desynced in practice. inputstream.ffmpegdirect avoids that
-          // by reopening the stream at a new `start` per seek instead of
-          // seeking within one connection - same technique the Xtream
-          // catchup path already uses, just against Dispatcharr's own
-          // catch-up proxy URL (session_id stays constant; only `start`
-          // changes, which the server correctly re-anchors to per-request).
-          const int durationMinutes = std::max(1, static_cast<int>((effectiveEnd - startTime) / 60));
-          dispatcharr::CatchupUrls urls;
-          if (!dispatchClient->CreateCatchupUrls(stream.uuid, startTime, durationMinutes, urls))
-          {
-            kodi::Log(ADDON_LOG_ERROR, "GetEPGTagStreamProperties: native catch-up session creation failed");
-            return PVR_ERROR_UNKNOWN;
-          }
-
-          kodi::Log(ADDON_LOG_INFO, "GetEPGTagStreamProperties: native catchup default_url = %s",
-                    urls.defaultUrl.c_str());
-
+          // Deliberately return no STREAMURL and no ffmpegdirect properties.
+          // Confirmed directly against the server (not just observed in
+          // Kodi) that neither a plain Range-seek on one session nor
+          // ffmpegdirect's reopen-with-a-new-`start` on one session actually
+          // moves playback - the server always keeps serving the original
+          // bind position. The only thing that reliably re-anchors is a
+          // genuinely new session per seek, which requires an addon-side API
+          // call ffmpegdirect's client-side URL substitution can't make.
+          // Returning empty properties here selects Kodi's raw
+          // OpenLiveStream/ReadLiveStream/SeekLiveStream byte-callback path
+          // instead (see NativeCatchupLiveStream), the same way
+          // GetRecordingStreamProperties returning no STREAMURL selects
+          // OpenRecordedStream below.
           const auto nowSteady = std::chrono::steady_clock::now();
           const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     nowSteady.time_since_epoch()).count();
           {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_pendingCatchupByChannel[channelUid] = PendingCatchup{
-              urls.defaultUrl, urls.templateUrl, nowMs + 30000, startTime, effectiveEnd, startTime, true
-            };
+            m_pendingNativeCatchupOpenByChannel[channelUid] =
+                PendingNativeCatchupOpen{stream.uuid, startTime, effectiveEnd, nowMs + 30000};
           }
-
-          properties.emplace_back(PVR_STREAM_PROPERTY_INPUTSTREAM, "inputstream.ffmpegdirect");
-          properties.emplace_back("inputstream-player", "videodefaultplayer");
-          properties.emplace_back("inputstream.ffmpegdirect.stream_mode", "catchup");
-          properties.emplace_back("inputstream.ffmpegdirect.default_url", urls.defaultUrl);
-          properties.emplace_back("inputstream.ffmpegdirect.catchup_url_format_string", urls.templateUrl);
-          properties.emplace_back("inputstream.ffmpegdirect.catchup_buffer_start_time", std::to_string(startTime));
-          properties.emplace_back("inputstream.ffmpegdirect.catchup_buffer_end_time", std::to_string(effectiveEnd));
-          if (isOngoing)
-          {
-            properties.emplace_back("inputstream.ffmpegdirect.catchup_terminates", "false");
-            properties.emplace_back("inputstream.ffmpegdirect.is_realtime_stream", "false");
-          }
-          else
-          {
-            properties.emplace_back("inputstream.ffmpegdirect.catchup_terminates", "true");
-            properties.emplace_back("inputstream.ffmpegdirect.is_realtime_stream", "false");
-          }
-
-          // Same UTC-compensation dance the Xtream ffmpegdirect path uses:
-          // ffmpegdirect calls SafeLocaltime() on the seek target before
-          // substituting {Y}/{m}/{d}/{H}/{M}, so a positive local-UTC offset
-          // is passed here to be subtracted first, netting out to UTC.
-          {
-            time_t nowUtcProbe = std::time(nullptr);
-            std::tm utcTm = {};
-            std::tm localTm = {};
-#ifdef _WIN32
-            gmtime_s(&utcTm, &nowUtcProbe);
-            localtime_s(&localTm, &nowUtcProbe);
-#else
-            gmtime_r(&nowUtcProbe, &utcTm);
-            localtime_r(&nowUtcProbe, &localTm);
-#endif
-            const time_t utcTime = timegm(&utcTm);
-            const time_t localAsUtc = timegm(&localTm);
-            const int timezoneOffsetSecs = static_cast<int>(localAsUtc - utcTime);
-            properties.emplace_back("inputstream.ffmpegdirect.timezone_shift", std::to_string(timezoneOffsetSecs));
-          }
-
-          properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, urls.defaultUrl);
-          properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
-          properties.emplace_back(PVR_STREAM_PROPERTY_EPGPLAYBACKASLIVE, "false");
-          properties.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE, "video/mp2t");
+          (void)isOngoing;
           return PVR_ERROR_NO_ERROR;
         }
 
@@ -3012,6 +3032,7 @@ private:
   // a settings reload replaces m_dispatcharrClient concurrently.
   std::shared_ptr<dispatcharr::Client> m_dispatcharrClient;
   std::unique_ptr<dispatcharr::recording::IRecordedStream> m_activeRecordedStream;
+  std::unique_ptr<dispatcharr::recording::NativeCatchupLiveStream> m_activeNativeLiveCatchupStream;
   std::string m_streamFormat;
   std::string m_channelNumbering;
   std::string m_filterPatternsRaw;
@@ -3042,7 +3063,20 @@ private:
     bool useFFmpegDirect = false;
   };
   std::unordered_map<unsigned int, PendingCatchup> m_pendingCatchupByChannel;
-  
+
+  // Native catchup: set by GetEPGTagStreamProperties (native api_mode),
+  // consumed by OpenLiveStream. Unlike PendingCatchup above, this selects
+  // Kodi's raw OpenLiveStream/ReadLiveStream/SeekLiveStream byte-callback
+  // path (no STREAMURL at all) - see NativeCatchupLiveStream for why.
+  struct PendingNativeCatchupOpen
+  {
+    std::string channelUuid;
+    time_t programStart = 0;
+    time_t programEnd = 0;
+    int64_t expiresAtMs = 0;
+  };
+  std::unordered_map<unsigned int, PendingNativeCatchupOpen> m_pendingNativeCatchupOpenByChannel;
+
   // Active catchup playback - persists during playback for GetStreamTimes/CanSeekStream/IsRealTimeStream
   PendingCatchup m_activeCatchup;
   unsigned int m_activeCatchupChannelUid = 0;
