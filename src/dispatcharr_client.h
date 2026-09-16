@@ -65,6 +65,37 @@ struct DispatchChannel
   std::string name;
   std::string uuid;
   std::string tvgId;    // Dispatcharr's tvg_id (may differ from Xtream's epg_channel_id)
+  int groupId = 0;      // channel_group_id
+  int logoId = 0;       // logo_id, 0 if unset
+  bool isCatchup = false;
+  int catchupDays = 0;
+};
+
+struct ChannelGroup
+{
+  int id = 0;
+  std::string name;
+};
+
+struct EpgProgram
+{
+  std::string tvgId;
+  std::string title;
+  std::string subtitle;
+  std::string description;
+  time_t startTime = 0;
+  time_t endTime = 0;
+};
+
+// A native catch-up (time-shift) playback session, created per-programme via
+// POST /api/catchup/sessions/. playbackUrl already carries the session_id and
+// is playable as-is; seeking is done with plain HTTP Range requests, no
+// ffmpegdirect timezone-shift template required.
+struct CatchupSession
+{
+  std::string sessionId;
+  std::string playbackUrl;
+  time_t expiresAt = 0;
 };
 
 class Client
@@ -75,12 +106,33 @@ public:
   // Auth
   bool EnsureToken();
   
-  // Channels (for ID mapping)
+  // Channels (for ID mapping, and as the native primary channel catalogue)
   bool FetchChannels(std::vector<DispatchChannel>& outChannels);
   int GetDispatchChannelId(int kodiChannelUid);  // Maps Kodi UID to Dispatcharr ID
   int GetKodiChannelUid(int dispatchChannelId);  // Maps Dispatcharr ID to Kodi UID
   std::string GetDispatchTvgId(int kodiChannelUid); // Maps Kodi UID to Dispatcharr tvg_id
-  
+
+  // Channel groups (native equivalent of Xtream live categories)
+  bool FetchChannelGroups(std::vector<ChannelGroup>& outGroups);
+
+  // Logos: map of logo id -> absolute image URL (id comes from DispatchChannel::logoId)
+  bool FetchLogos(std::map<int, std::string>& outLogoUrlsById);
+
+  // Live playback URL for a channel, via Dispatcharr's own stream proxy
+  // (not the Xtream-compat /live/ path). Embeds a fresh access token as a
+  // query param since Kodi's PVR stream properties carry a bare URL only.
+  std::string BuildLiveStreamUrl(const std::string& channelUuid);
+
+  // EPG grid for a time window, flattened to one entry per programme.
+  bool FetchEpgGrid(time_t start, time_t end, std::vector<EpgProgram>& outPrograms);
+
+  // Catch-up (time-shift) sessions
+  bool CreateCatchupSession(const std::string& channelUuid,
+                            time_t programStart,
+                            int durationMinutes,
+                            CatchupSession& outSession);
+  bool DeleteCatchupSession(const std::string& sessionId);
+
   // Series Rules (Season Pass)
   bool FetchSeriesRules(std::vector<SeriesRule>& outRules);
   bool AddSeriesRule(const std::string& tvgId, const std::string& title, const std::string& mode);

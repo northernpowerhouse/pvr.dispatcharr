@@ -295,6 +295,22 @@ bool ForEachObjectInArray(std::string_view jsonArray, Fn&& fn)
   return true;
 }
 
+// Reduces an absolute URL (as returned in a DRF "next" pagination link, which
+// may advertise a different host/port than our configured server) down to
+// just its path+query, so pagination and playback URLs always get re-issued
+// against the server the user actually configured. Mirrors the same trick
+// already used for HLS playlist URIs in DownloadRecordingSegment().
+std::string StripToPathAndQuery(const std::string& urlOrPath)
+{
+  if (urlOrPath.rfind("http://", 0) != 0 && urlOrPath.rfind("https://", 0) != 0)
+    return urlOrPath;
+  const size_t scheme = urlOrPath.find("://");
+  const size_t path = urlOrPath.find('/', scheme + 3);
+  if (path == std::string::npos)
+    return "";
+  return urlOrPath.substr(path);
+}
+
 } // namespace
 
 
@@ -643,22 +659,210 @@ bool Client::DeleteRecurringRule(int id)
 bool Client::FetchChannels(std::vector<DispatchChannel>& outChannels)
 {
   if (!EnsureToken()) return false;
-  auto resp = Request("GET", "/api/channels/channels/");
-  if (resp.statusCode != 200) return false;
-  
   outChannels.clear();
-  ForEachObjectInArray(resp.body, [&](std::string_view obj){
-    DispatchChannel ch;
-    if (ExtractIntField(obj, "id", ch.id)) {
-      // channel_number is a float in the API, but we'll read as int
-      ExtractIntField(obj, "channel_number", ch.channelNumber);
-      ExtractStringField(obj, "name", ch.name);
-      ExtractStringField(obj, "uuid", ch.uuid);
-      ExtractStringField(obj, "tvg_id", ch.tvgId);
-      outChannels.push_back(ch);
+
+  // /api/channels/channels/ is paginated (DRF envelope: count/next/previous/
+  // results), so a single request only returns the first page's worth of
+  // channels. Follow "next" until exhausted. A large page_size keeps this to
+  // one or two requests for a typical few-thousand-channel catalogue.
+  std::string endpoint = "/api/channels/channels/?page_size=500";
+  while (!endpoint.empty())
+  {
+    auto resp = Request("GET", endpoint);
+    if (resp.statusCode != 200) return !outChannels.empty();
+
+    std::string_view bodyView(resp.body);
+    std::string_view arrayView;
+    const bool paginated = ExtractRawJsonField(bodyView, "results", arrayView);
+    std::string_view toIterate = paginated ? arrayView : bodyView;
+
+    ForEachObjectInArray(toIterate, [&](std::string_view obj){
+      DispatchChannel ch;
+      if (ExtractIntField(obj, "id", ch.id)) {
+        // channel_number is a float in the API, but we'll read as int
+        ExtractIntField(obj, "channel_number", ch.channelNumber);
+        ExtractStringField(obj, "name", ch.name);
+        ExtractStringField(obj, "uuid", ch.uuid);
+        ExtractStringField(obj, "tvg_id", ch.tvgId);
+        ExtractIntField(obj, "channel_group_id", ch.groupId);
+        ExtractIntField(obj, "logo_id", ch.logoId);
+        ExtractBoolField(obj, "is_catchup", ch.isCatchup);
+        ExtractIntField(obj, "catchup_days", ch.catchupDays);
+        outChannels.push_back(ch);
+      }
+    });
+
+    if (!paginated) break;
+
+    std::string nextUrl;
+    if (!ExtractStringField(bodyView, "next", nextUrl) || nextUrl.empty()) break;
+    endpoint = StripToPathAndQuery(nextUrl);
+    if (endpoint.empty()) break;
+  }
+  return true;
+}
+
+bool Client::FetchChannelGroups(std::vector<ChannelGroup>& outGroups)
+{
+  if (!EnsureToken()) return false;
+  outGroups.clear();
+
+  std::string endpoint = "/api/channels/groups/?page_size=500";
+  while (!endpoint.empty())
+  {
+    auto resp = Request("GET", endpoint);
+    if (resp.statusCode != 200) return !outGroups.empty();
+
+    std::string_view bodyView(resp.body);
+    std::string_view arrayView;
+    const bool paginated = ExtractRawJsonField(bodyView, "results", arrayView);
+    std::string_view toIterate = paginated ? arrayView : bodyView;
+
+    ForEachObjectInArray(toIterate, [&](std::string_view obj){
+      ChannelGroup g;
+      if (ExtractIntField(obj, "id", g.id)) {
+        ExtractStringField(obj, "name", g.name);
+        outGroups.push_back(g);
+      }
+    });
+
+    if (!paginated) break;
+
+    std::string nextUrl;
+    if (!ExtractStringField(bodyView, "next", nextUrl) || nextUrl.empty()) break;
+    endpoint = StripToPathAndQuery(nextUrl);
+    if (endpoint.empty()) break;
+  }
+  return true;
+}
+
+bool Client::FetchLogos(std::map<int, std::string>& outLogoUrlsById)
+{
+  if (!EnsureToken()) return false;
+  outLogoUrlsById.clear();
+
+  std::string endpoint = "/api/channels/logos/?page_size=500";
+  while (!endpoint.empty())
+  {
+    auto resp = Request("GET", endpoint);
+    if (resp.statusCode != 200) return !outLogoUrlsById.empty();
+
+    std::string_view bodyView(resp.body);
+    std::string_view arrayView;
+    const bool paginated = ExtractRawJsonField(bodyView, "results", arrayView);
+    std::string_view toIterate = paginated ? arrayView : bodyView;
+
+    ForEachObjectInArray(toIterate, [&](std::string_view obj){
+      int id = 0;
+      if (ExtractIntField(obj, "id", id)) {
+        // Prefer Dispatcharr's cached copy over the (possibly unreachable)
+        // origin logo URL.
+        std::string url;
+        if (!ExtractStringField(obj, "cache_url", url) || url.empty())
+          ExtractStringField(obj, "url", url);
+        if (!url.empty())
+          outLogoUrlsById[id] = (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0)
+              ? url : GetBaseUrl() + url;
+      }
+    });
+
+    if (!paginated) break;
+
+    std::string nextUrl;
+    if (!ExtractStringField(bodyView, "next", nextUrl) || nextUrl.empty()) break;
+    endpoint = StripToPathAndQuery(nextUrl);
+    if (endpoint.empty()) break;
+  }
+  return true;
+}
+
+std::string Client::BuildLiveStreamUrl(const std::string& channelUuid)
+{
+  if (!EnsureToken()) return "";
+  // JWTs use the URL-safe base64 alphabet plus '.' separators, so no
+  // percent-encoding is needed here.
+  return GetBaseUrl() + "/proxy/ts/stream/" + channelUuid + "?token=" + m_accessToken;
+}
+
+bool Client::FetchEpgGrid(time_t start, time_t end, std::vector<EpgProgram>& outPrograms)
+{
+  if (!EnsureToken()) return false;
+  outPrograms.clear();
+
+  std::ostringstream endpoint;
+  endpoint << "/api/epg/grid/?start=" << TimeToIso(start) << "&end=" << TimeToIso(end);
+  auto resp = Request("GET", endpoint.str());
+  if (resp.statusCode != 200) return false;
+
+  std::string_view bodyView(resp.body);
+  std::string_view dataArray;
+  if (!ExtractRawJsonField(bodyView, "data", dataArray)) return false;
+
+  ForEachObjectInArray(dataArray, [&](std::string_view obj){
+    EpgProgram p;
+    if (ExtractStringField(obj, "tvg_id", p.tvgId) && !p.tvgId.empty()) {
+      ExtractStringField(obj, "title", p.title);
+      ExtractStringField(obj, "sub_title", p.subtitle);
+      ExtractStringField(obj, "description", p.description);
+      std::string sVal;
+      if (ExtractStringField(obj, "start_time", sVal)) p.startTime = ParseIsoTime(sVal);
+      if (ExtractStringField(obj, "end_time", sVal)) p.endTime = ParseIsoTime(sVal);
+      outPrograms.push_back(p);
     }
   });
   return true;
+}
+
+bool Client::CreateCatchupSession(const std::string& channelUuid,
+                                  time_t programStart,
+                                  int durationMinutes,
+                                  CatchupSession& outSession)
+{
+  if (!EnsureToken()) return false;
+
+  std::stringstream ss;
+  ss << "{\"channel_uuid\":\"" << JsonEscape(channelUuid) << "\""
+     << ",\"start\":\"" << TimeToIso(programStart) << "\"";
+  if (durationMinutes > 0)
+    ss << ",\"duration\":" << durationMinutes;
+  ss << "}";
+
+  auto resp = Request("POST", "/api/catchup/sessions/", ss.str());
+  if (resp.statusCode != 201) {
+    kodi::Log(ADDON_LOG_ERROR,
+              "pvr.dispatcharr: CreateCatchupSession failed - statusCode=%d, body=%s",
+              resp.statusCode, resp.body.substr(0, 200).c_str());
+    return false;
+  }
+
+  std::string sessionId, playbackUrl;
+  if (!ExtractStringField(resp.body, "session_id", sessionId) ||
+      !ExtractStringField(resp.body, "playback_url", playbackUrl)) {
+    kodi::Log(ADDON_LOG_ERROR, "pvr.dispatcharr: CreateCatchupSession - malformed response: %s",
+              resp.body.substr(0, 200).c_str());
+    return false;
+  }
+
+  int expiresAt = 0;
+  ExtractIntField(resp.body, "expires_at", expiresAt);
+
+  outSession.sessionId = sessionId;
+  outSession.playbackUrl = (playbackUrl.rfind("http://", 0) == 0 || playbackUrl.rfind("https://", 0) == 0)
+      ? playbackUrl : GetBaseUrl() + playbackUrl;
+  outSession.expiresAt = static_cast<time_t>(expiresAt);
+  return true;
+}
+
+bool Client::DeleteCatchupSession(const std::string& sessionId)
+{
+  if (!EnsureToken()) return false;
+  auto resp = Request("DELETE", "/api/catchup/sessions/" + sessionId + "/");
+  // HTTP 204 No Content is the correct response for DELETE
+  bool success = (resp.statusCode == 200 || resp.statusCode == 204);
+  kodi::Log(success ? ADDON_LOG_DEBUG : ADDON_LOG_WARNING,
+            "pvr.dispatcharr: DeleteCatchupSession result - success=%d, statusCode=%d",
+            success, resp.statusCode);
+  return success;
 }
 
 bool Client::EnsureChannelMapping()
