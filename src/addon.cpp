@@ -2875,7 +2875,7 @@ private:
       categoryFilterMode = "all";
 
     const std::string sig = xt.server + ":" + std::to_string(xt.port) + "/" + xt.username + "/" +
-                HashHex(xt.password) + "|fmt=" + ToLower(streamFormat) + "|num=" +
+                HashHex(xt.password) + "|api=" + ToLower(xt.apiMode) + "|fmt=" + ToLower(streamFormat) + "|num=" +
                 ToLower(channelNumbering) + "|flt=" + HashHex(filterRaw) + "|catmode=" +
                 ToLower(categoryFilterMode) + "|catflt=" + HashHex(categoryFilterRaw) + "|sep=" +
                 (filterChannelSeparators ? "1" : "0");
