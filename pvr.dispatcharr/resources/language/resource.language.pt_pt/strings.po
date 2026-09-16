@@ -31,6 +31,18 @@ msgctxt "#30005"
 msgid "Request timeout (seconds)"
 msgstr "Tempo limite do pedido (segundos)"
 
+msgctxt "#30007"
+msgid "API mode"
+msgstr "Modo de API"
+
+msgctxt "#30008"
+msgid "Native (Dispatcharr)"
+msgstr "Nativo (Dispatcharr)"
+
+msgctxt "#30009"
+msgid "Xtream Codes (compatibility)"
+msgstr "Xtream Codes (compatibilidade)"
+
 msgctxt "#30100"
 msgid "Streaming"
 msgstr "Transmissão"

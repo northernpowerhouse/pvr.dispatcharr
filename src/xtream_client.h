@@ -16,6 +16,11 @@ struct Settings
   std::string dispatcharrPassword; // Separate password for API
   int timeoutSeconds = 30;
 
+  // "xtream" (default, provider-compatibility layer) or "native" (Dispatcharr's
+  // own REST API - channels/groups/EPG/live/catchup all sourced from
+  // dispatcharr::Client instead of the Xtream Codes emulation layer below).
+  std::string apiMode = "xtream";
+
   bool enableUserAgentSpoofing = false;
   std::string customUserAgent;
   
@@ -46,10 +51,15 @@ struct LiveStream
   std::string name;
   std::string icon;
   std::string epgChannelId; // XMLTV channel id from provider (if available)
-  
+
   // Catchup/Archive support
   bool tvArchive = false;
   int tvArchiveDuration = 0; // Duration in days
+
+  // Dispatcharr channel UUID. Only populated when Settings::apiMode == "native"
+  // (the Xtream compatibility path has no concept of it) - needed to build
+  // native live/catchup URLs via dispatcharr::Client.
+  std::string uuid;
 };
 
 struct EpgEntry

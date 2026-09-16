@@ -31,6 +31,18 @@ msgctxt "#30006"
 msgid "Dispatcharr Password"
 msgstr "Dispatcharr Password"
 
+msgctxt "#30007"
+msgid "API mode"
+msgstr "API mode"
+
+msgctxt "#30008"
+msgid "Native (Dispatcharr)"
+msgstr "Native (Dispatcharr)"
+
+msgctxt "#30009"
+msgid "Xtream Codes (compatibility)"
+msgstr "Xtream Codes (compatibility)"
+
 
 msgctxt "#30100"
 msgid "Streaming"

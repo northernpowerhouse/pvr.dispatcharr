@@ -65,6 +65,19 @@
           </constraints>
           <control type="edit" format="integer" delayed="false" />
         </setting>
+        <setting id="api_mode" type="string" label="30007" help="">
+          <level>0</level>
+          <default>xtream</default>
+          <constraints>
+            <options>
+              <option label="30009" value="xtream">xtream</option>
+              <option label="30008" value="native">native</option>
+            </options>
+          </constraints>
+          <control type="list" format="string">
+            <heading>30007</heading>
+          </control>
+        </setting>
       </group>
     </category>
 

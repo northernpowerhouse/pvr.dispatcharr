@@ -1028,6 +1028,9 @@ Settings LoadSettings()
   kodi::addon::GetSettingString("password", s.password);
   kodi::addon::GetSettingString("dispatcharr_password", s.dispatcharrPassword);
   kodi::addon::GetSettingInt("timeout_seconds", s.timeoutSeconds);
+  kodi::addon::GetSettingString("api_mode", s.apiMode);
+  if (s.apiMode.empty())
+    s.apiMode = "xtream";
   kodi::addon::GetSettingInt("catchup_start_offset_hours", s.catchupStartOffsetHours);
   kodi::addon::GetSettingBoolean("enable_user_agent_spoofing", s.enableUserAgentSpoofing);
   kodi::addon::GetSettingString("custom_user_agent", s.customUserAgent);
@@ -1052,6 +1055,8 @@ Settings LoadSettings()
       if (ExtractSettingValue(xml, "dispatcharr_password", tmp))
         s.dispatcharrPassword = tmp;
       ExtractSettingInt(xml, "timeout_seconds", s.timeoutSeconds);
+      if (ExtractSettingValue(xml, "api_mode", tmp) && !tmp.empty())
+        s.apiMode = tmp;
       ExtractSettingInt(xml, "catchup_start_offset_hours", s.catchupStartOffsetHours);
       ExtractSettingBool(xml, "enable_user_agent_spoofing", s.enableUserAgentSpoofing);
       if (ExtractSettingValue(xml, "custom_user_agent", tmp))

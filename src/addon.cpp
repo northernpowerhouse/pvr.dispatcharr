@@ -355,6 +355,123 @@ bool ShouldFilterOut(const std::vector<std::string>& patternsLower, const std::s
   }
   return false;
 }
+
+// --- Native API translation helpers -------------------------------------
+// Adapts dispatcharr::Client's native channel/group/EPG data into the same
+// xtream::LiveCategory/LiveStream/ChannelEpg shapes the rest of this file
+// already knows how to filter, group, cache, and match EPG against, so
+// everything downstream of the fetch is shared between api_mode "xtream"
+// and "native" unchanged.
+
+bool FetchNativeCategoriesAndStreams(dispatcharr::Client& client,
+                                     std::vector<xtream::LiveCategory>& categories,
+                                     std::vector<xtream::LiveStream>& streams,
+                                     std::string& errorDetails)
+{
+  std::vector<dispatcharr::ChannelGroup> groups;
+  if (!client.FetchChannelGroups(groups))
+  {
+    errorDetails = "failed to fetch channel groups";
+    return false;
+  }
+
+  std::vector<dispatcharr::DispatchChannel> nativeChannels;
+  if (!client.FetchChannels(nativeChannels))
+  {
+    errorDetails = "failed to fetch channels";
+    return false;
+  }
+
+  // Best-effort: a failed logo fetch just means channels load without icons.
+  std::map<int, std::string> logoUrlsById;
+  client.FetchLogos(logoUrlsById);
+
+  categories.clear();
+  categories.reserve(groups.size());
+  for (const auto& g : groups)
+  {
+    xtream::LiveCategory c;
+    c.id = g.id;
+    c.name = g.name;
+    categories.push_back(std::move(c));
+  }
+
+  streams.clear();
+  streams.reserve(nativeChannels.size());
+  for (const auto& ch : nativeChannels)
+  {
+    xtream::LiveStream s;
+    s.id = ch.id;
+    s.categoryId = ch.groupId;
+    s.number = ch.channelNumber;
+    s.name = ch.name;
+    s.epgChannelId = ch.tvgId;
+    s.tvArchive = ch.isCatchup;
+    s.tvArchiveDuration = ch.catchupDays;
+    s.uuid = ch.uuid;
+    if (ch.logoId > 0)
+    {
+      const auto logoIt = logoUrlsById.find(ch.logoId);
+      if (logoIt != logoUrlsById.end())
+        s.icon = logoIt->second;
+    }
+    streams.push_back(std::move(s));
+  }
+
+  return true;
+}
+
+bool FetchNativeEpg(dispatcharr::Client& client,
+                    const std::vector<xtream::LiveStream>& streams,
+                    std::vector<xtream::ChannelEpg>& out)
+{
+  std::unordered_map<std::string, int> tvgIdToStreamId;
+  tvgIdToStreamId.reserve(streams.size());
+  for (const auto& s : streams)
+  {
+    if (!s.epgChannelId.empty())
+      tvgIdToStreamId[s.epgChannelId] = s.id;
+  }
+
+  // Wide enough to cover typical forward EPG guide depth plus the longest
+  // realistic catch-up archive window; refreshed hourly by the same EPG
+  // worker thread that drives the Xtream XMLTV path (kEpgRefreshInterval).
+  const time_t now = std::time(nullptr);
+  const time_t start = now - (14 * 24 * 3600);
+  const time_t end = now + (7 * 24 * 3600);
+
+  std::vector<dispatcharr::EpgProgram> programs;
+  if (!client.FetchEpgGrid(start, end, programs))
+    return false;
+
+  std::unordered_map<std::string, xtream::ChannelEpg> epgMap;
+  for (const auto& p : programs)
+  {
+    const auto idIt = tvgIdToStreamId.find(p.tvgId);
+    if (idIt == tvgIdToStreamId.end())
+      continue;
+
+    const std::string channelIdStr = std::to_string(idIt->second);
+    xtream::ChannelEpg& target = epgMap[channelIdStr];
+    target.id = channelIdStr;
+
+    xtream::EpgEntry entry;
+    entry.channelId = channelIdStr;
+    entry.startTime = p.startTime;
+    entry.endTime = p.endTime;
+    entry.title = p.title;
+    entry.description = p.description;
+    entry.episodeName = p.subtitle;
+    target.entries[p.startTime] = std::move(entry);
+  }
+
+  out.clear();
+  out.reserve(epgMap.size());
+  for (auto& kv : epgMap)
+    out.push_back(std::move(kv.second));
+  return true;
+}
+
 }
 
 class ATTR_DLL_LOCAL CXtreamCodesPVRClient final : public kodi::addon::CInstancePVRClient
@@ -1256,13 +1373,52 @@ public:
     if (it == uidToStream->end())
       return PVR_ERROR_UNKNOWN;
 
+    if (settings.apiMode == "native")
+    {
+      std::string uuid;
+      if (streams)
+      {
+        for (const auto& s : *streams)
+        {
+          if (static_cast<unsigned int>(s.id) == uid)
+          {
+            uuid = s.uuid;
+            break;
+          }
+        }
+      }
+      if (uuid.empty())
+        return PVR_ERROR_UNKNOWN;
+
+      std::shared_ptr<dispatcharr::Client> dispatchClient;
+      {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        dispatchClient = m_dispatcharrClient;
+      }
+      if (!dispatchClient)
+        return PVR_ERROR_SERVER_ERROR;
+
+      const std::string nativeUrl = dispatchClient->BuildLiveStreamUrl(uuid);
+      if (nativeUrl.empty())
+        return PVR_ERROR_UNKNOWN;
+
+      kodi::Log(ADDON_LOG_DEBUG, "GetChannelStreamProperties: using native LIVE URL = %s", nativeUrl.c_str());
+      properties.emplace_back(PVR_STREAM_PROPERTY_INPUTSTREAM, PVR_STREAM_PROPERTY_VALUE_INPUTSTREAMFFMPEG);
+      properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, nativeUrl);
+      properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "true");
+      // Dispatcharr's stream proxy always serves MPEG-TS, regardless of the
+      // Xtream-path stream_format setting.
+      properties.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE, "video/mp2t");
+      return PVR_ERROR_NO_ERROR;
+    }
+
     const int streamId = it->second;
     const std::string url = xtream::BuildLiveStreamUrl(settings, streamId, streamFormat);
     if (url.empty())
       return PVR_ERROR_UNKNOWN;
 
     kodi::Log(ADDON_LOG_DEBUG, "GetChannelStreamProperties: using LIVE URL = %s", url.c_str());
-    
+
     // For live streams, use Kodi's built-in ffmpeg inputstream.
     // We cannot use inputstream.ffmpegdirect for channel switching because it has a bug:
     // When m_reopen=true (which happens during transport stream reopens), ffmpegdirect
@@ -1551,6 +1707,50 @@ public:
         // Build catchup URL (use 'now' as end for ongoing programmes)
         const bool isOngoing = (endTime > nowTs);
         const time_t effectiveEnd = isOngoing ? nowTs : endTime;
+
+        if (settings.apiMode == "native")
+        {
+          if (stream.uuid.empty())
+            return PVR_ERROR_UNKNOWN;
+
+          std::shared_ptr<dispatcharr::Client> dispatchClient;
+          {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            dispatchClient = m_dispatcharrClient;
+          }
+          if (!dispatchClient)
+            return PVR_ERROR_SERVER_ERROR;
+
+          const int durationMinutes = std::max(1, static_cast<int>((effectiveEnd - startTime) / 60));
+          dispatcharr::CatchupSession session;
+          if (!dispatchClient->CreateCatchupSession(stream.uuid, startTime, durationMinutes, session))
+          {
+            kodi::Log(ADDON_LOG_ERROR, "GetEPGTagStreamProperties: native catch-up session creation failed");
+            return PVR_ERROR_UNKNOWN;
+          }
+
+          kodi::Log(ADDON_LOG_INFO, "GetEPGTagStreamProperties: native catchup playback_url = %s",
+                    session.playbackUrl.c_str());
+
+          const auto nowSteady = std::chrono::steady_clock::now();
+          const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    nowSteady.time_since_epoch()).count();
+          {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            // Native catch-up seeks via plain HTTP Range on the session URL -
+            // no ffmpegdirect timezone-shift template needed.
+            m_pendingCatchupByChannel[channelUid] = PendingCatchup{
+              session.playbackUrl, "", nowMs + 30000, startTime, effectiveEnd, startTime, false
+            };
+          }
+
+          properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, session.playbackUrl);
+          properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
+          properties.emplace_back(PVR_STREAM_PROPERTY_EPGPLAYBACKASLIVE, "false");
+          properties.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE, "video/mp2t");
+          return PVR_ERROR_NO_ERROR;
+        }
+
         const std::string url = xtream::BuildCatchupUrl(settings, stream.id, startTime, effectiveEnd, streamFormat);
         kodi::Log(ADDON_LOG_INFO, "GetEPGTagStreamProperties: catchup URL = %s, isOngoing=%d", url.c_str(), isOngoing);
         
@@ -1938,6 +2138,7 @@ private:
       {
         uint64_t gen = 0;
         xtream::Settings settings;
+        std::shared_ptr<dispatcharr::Client> dispatchClient;
         std::shared_ptr<const std::vector<xtream::LiveStream>> streams;
 
         {
@@ -1950,6 +2151,7 @@ private:
           m_epgRefreshInProgress = true;
           gen = m_generation.load();
           settings = m_xtreamSettings;
+          dispatchClient = m_dispatcharrClient;
           streams = m_streams;
         }
 
@@ -1960,10 +2162,22 @@ private:
           continue;
         }
 
-        std::string xmltvData;
-        const xtream::FetchResult fetchResult = xtream::FetchXMLTVEpg(settings, xmltvData);
         std::vector<xtream::ChannelEpg> parsedEpg;
-        const bool parsed = fetchResult.ok && xtream::ParseXMLTV(xmltvData, *streams, parsedEpg);
+        bool parsed = false;
+        std::string fetchDetails;
+        if (settings.apiMode == "native")
+        {
+          parsed = dispatchClient && FetchNativeEpg(*dispatchClient, *streams, parsedEpg);
+          if (!parsed)
+            fetchDetails = "failed to fetch/translate native EPG grid";
+        }
+        else
+        {
+          std::string xmltvData;
+          const xtream::FetchResult fetchResult = xtream::FetchXMLTVEpg(settings, xmltvData);
+          parsed = fetchResult.ok && xtream::ParseXMLTV(xmltvData, *streams, parsedEpg);
+          fetchDetails = fetchResult.details;
+        }
         std::vector<unsigned int> channelUids;
 
         {
@@ -1987,15 +2201,10 @@ private:
           }
         }
 
-        if (!fetchResult.ok)
-        {
-          kodi::Log(ADDON_LOG_WARNING, "pvr.dispatcharr: failed to refresh XMLTV EPG data: %s",
-                    fetchResult.details.c_str());
-          continue;
-        }
         if (!parsed)
         {
-          kodi::Log(ADDON_LOG_WARNING, "pvr.dispatcharr: failed to parse refreshed XMLTV data");
+          kodi::Log(ADDON_LOG_WARNING, "pvr.dispatcharr: failed to refresh EPG data: %s",
+                    fetchDetails.c_str());
           continue;
         }
 
@@ -2054,6 +2263,7 @@ private:
       {
         uint64_t gen = 0;
         xtream::Settings settings;
+        std::shared_ptr<dispatcharr::Client> dispatchClient;
         std::string streamFormat;
         std::string channelNumbering;
         std::string filterRaw;
@@ -2073,6 +2283,7 @@ private:
 
           gen = m_generation.load();
           settings = m_xtreamSettings;
+          dispatchClient = m_dispatcharrClient;
           streamFormat = m_streamFormat;
           channelNumbering = m_channelNumbering;
           filterRaw = m_filterPatternsRaw;
@@ -2083,28 +2294,6 @@ private:
 
         kodi::QueueNotification(QUEUE_INFO, ADDON_NAME, "Loading channels...");
         const auto t0 = std::chrono::steady_clock::now();
-
-        std::vector<xtream::LiveCategory> categories;
-        std::vector<xtream::LiveStream> streams;
-        const xtream::FetchResult catsRes = xtream::FetchLiveCategories(settings, categories);
-
-        // If settings changed while we were loading, discard results and immediately loop.
-        if (m_stopRequested || gen != m_generation.load())
-          continue;
-
-        if (!catsRes.ok)
-        {
-          {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_loading = false;
-            m_dataLoaded = false;
-            m_workRequested = false;
-          }
-          kodi::Log(ADDON_LOG_ERROR, "pvr.dispatcharr: failed to load Xtream categories (%s)", catsRes.details.c_str());
-          kodi::QueueNotification(QUEUE_ERROR, ADDON_NAME,
-                                 (std::string("Channel load failed: ") + catsRes.details).c_str());
-          continue;
-        }
 
         const std::vector<std::string> patterns = SplitPatterns(filterRaw);
         const std::vector<std::string> categoryPatterns = SplitPatterns(categoryFilterRaw);
@@ -2120,48 +2309,45 @@ private:
             m_dataLoaded = false;
             m_workRequested = false;
           }
-          kodi::Log(ADDON_LOG_ERROR, "pvr.dispatcharr: failed to load Xtream streams (%s)", details.c_str());
+          kodi::Log(ADDON_LOG_ERROR, "pvr.dispatcharr: failed to load channels (%s)", details.c_str());
           kodi::QueueNotification(QUEUE_ERROR, ADDON_NAME,
                                  (std::string("Channel load failed: ") + details).c_str());
         };
 
-        // Stream fetch strategy:
-        // - When category filtering is inactive (or includes "Uncategorized"), prefer single-call all streams.
-        // - When category filtering is active and the kept set is small, fetch streams per category.
-        if (categoryPatterns.empty() || categoryModeLower == "all" || wantsUncategorized)
+        std::vector<xtream::LiveCategory> categories;
+        std::vector<xtream::LiveStream> streams;
+
+        if (settings.apiMode == "native")
         {
-          const xtream::FetchResult sRes = xtream::FetchLiveStreams(settings, 0, streams);
-          if (!sRes.ok)
+          std::string nativeError = dispatchClient ? std::string() : std::string("Dispatcharr client not initialised");
+          if (!nativeError.empty() || !FetchNativeCategoriesAndStreams(*dispatchClient, categories, streams, nativeError))
           {
-            failLoad(sRes.details);
+            failLoad(nativeError);
             continue;
           }
+
+          // If settings changed while we were loading, discard results and immediately loop.
+          if (m_stopRequested || gen != m_generation.load())
+            continue;
         }
         else
         {
-          std::vector<int> keepCatIds;
-          keepCatIds.reserve(categories.size());
-          for (const auto& c : categories)
+          const xtream::FetchResult catsRes = xtream::FetchLiveCategories(settings, categories);
+
+          // If settings changed while we were loading, discard results and immediately loop.
+          if (m_stopRequested || gen != m_generation.load())
+            continue;
+
+          if (!catsRes.ok)
           {
-            if (c.id <= 0 || c.name.empty())
-              continue;
-            const bool match = ShouldFilterOut(categoryPatterns, c.name);
-            if (categoryModeLower == "include")
-            {
-              if (match)
-                keepCatIds.push_back(c.id);
-            }
-            else if (categoryModeLower == "exclude")
-            {
-              if (!match)
-                keepCatIds.push_back(c.id);
-            }
+            failLoad(catsRes.details);
+            continue;
           }
 
-          const size_t totalCats = categories.size();
-          const bool usePerCategory = (keepCatIds.size() <= 20) ||
-                                      (totalCats > 0 && keepCatIds.size() * 4 <= totalCats);
-          if (!usePerCategory)
+          // Stream fetch strategy:
+          // - When category filtering is inactive (or includes "Uncategorized"), prefer single-call all streams.
+          // - When category filtering is active and the kept set is small, fetch streams per category.
+          if (categoryPatterns.empty() || categoryModeLower == "all" || wantsUncategorized)
           {
             const xtream::FetchResult sRes = xtream::FetchLiveStreams(settings, 0, streams);
             if (!sRes.ok)
@@ -2172,25 +2358,59 @@ private:
           }
           else
           {
-            streams.clear();
-            std::vector<xtream::LiveStream> tmp;
-            for (const int catId : keepCatIds)
+            std::vector<int> keepCatIds;
+            keepCatIds.reserve(categories.size());
+            for (const auto& c : categories)
             {
-              tmp.clear();
-              const xtream::FetchResult sRes = xtream::FetchLiveStreams(settings, catId, tmp);
+              if (c.id <= 0 || c.name.empty())
+                continue;
+              const bool match = ShouldFilterOut(categoryPatterns, c.name);
+              if (categoryModeLower == "include")
+              {
+                if (match)
+                  keepCatIds.push_back(c.id);
+              }
+              else if (categoryModeLower == "exclude")
+              {
+                if (!match)
+                  keepCatIds.push_back(c.id);
+              }
+            }
+
+            const size_t totalCats = categories.size();
+            const bool usePerCategory = (keepCatIds.size() <= 20) ||
+                                        (totalCats > 0 && keepCatIds.size() * 4 <= totalCats);
+            if (!usePerCategory)
+            {
+              const xtream::FetchResult sRes = xtream::FetchLiveStreams(settings, 0, streams);
               if (!sRes.ok)
               {
-                // Fallback to single call.
-                streams.clear();
-                const xtream::FetchResult sRes2 = xtream::FetchLiveStreams(settings, 0, streams);
-                if (!sRes2.ok)
-                {
-                  failLoad(sRes2.details);
-                  goto fetched;
-                }
-                break;
+                failLoad(sRes.details);
+                continue;
               }
-              streams.insert(streams.end(), tmp.begin(), tmp.end());
+            }
+            else
+            {
+              streams.clear();
+              std::vector<xtream::LiveStream> tmp;
+              for (const int catId : keepCatIds)
+              {
+                tmp.clear();
+                const xtream::FetchResult sRes = xtream::FetchLiveStreams(settings, catId, tmp);
+                if (!sRes.ok)
+                {
+                  // Fallback to single call.
+                  streams.clear();
+                  const xtream::FetchResult sRes2 = xtream::FetchLiveStreams(settings, 0, streams);
+                  if (!sRes2.ok)
+                  {
+                    failLoad(sRes2.details);
+                    goto fetched;
+                  }
+                  break;
+                }
+                streams.insert(streams.end(), tmp.begin(), tmp.end());
+              }
             }
           }
         }
@@ -2694,7 +2914,7 @@ private:
                       ? m_xtreamSettings.dispatcharrPassword 
                       : m_xtreamSettings.password;
       ds.timeoutSeconds = m_xtreamSettings.timeoutSeconds;
-      m_dispatcharrClient = std::make_unique<dispatcharr::Client>(ds);
+      m_dispatcharrClient = std::make_shared<dispatcharr::Client>(ds);
 
       m_streamFormat = ToLower(streamFormat);
       m_channelNumbering = ToLower(channelNumbering);
@@ -2740,7 +2960,11 @@ private:
   bool m_hasSettingsOverride = false;
   xtream::Settings m_settingsOverride;
   xtream::Settings m_xtreamSettings;
-  std::unique_ptr<dispatcharr::Client> m_dispatcharrClient;
+  // shared_ptr (not unique_ptr): the channel/EPG worker threads take a copy
+  // of this under m_mutex when native api_mode is active, so the Client must
+  // stay alive for as long as an in-flight fetch holds a reference, even if
+  // a settings reload replaces m_dispatcharrClient concurrently.
+  std::shared_ptr<dispatcharr::Client> m_dispatcharrClient;
   std::unique_ptr<dispatcharr::recording::IRecordedStream> m_activeRecordedStream;
   std::string m_streamFormat;
   std::string m_channelNumbering;
