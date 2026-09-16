@@ -1699,11 +1699,21 @@ public:
     }
 
     if (!hasPending || !dispatchClient)
+    {
+      kodi::Log(ADDON_LOG_WARNING, "OpenLiveStream: called with no pending native catchup open for channel %u",
+                channel.GetUniqueId());
       return false;
+    }
+
+    kodi::Log(ADDON_LOG_INFO, "OpenLiveStream: opening native catchup uuid=%s start=%ld end=%ld",
+              pending.channelUuid.c_str(), pending.programStart, pending.programEnd);
 
     auto stream = std::make_unique<dispatcharr::recording::NativeCatchupLiveStream>(*dispatchClient);
     if (!stream->Open(pending.channelUuid, pending.programStart, pending.programEnd))
+    {
+      kodi::Log(ADDON_LOG_ERROR, "OpenLiveStream: NativeCatchupLiveStream::Open failed");
       return false;
+    }
 
     m_activeNativeLiveCatchupStream = std::move(stream);
     return true;
@@ -1800,11 +1810,18 @@ public:
           // bind position. The only thing that reliably re-anchors is a
           // genuinely new session per seek, which requires an addon-side API
           // call ffmpegdirect's client-side URL substitution can't make.
-          // Returning empty properties here selects Kodi's raw
-          // OpenLiveStream/ReadLiveStream/SeekLiveStream byte-callback path
-          // instead (see NativeCatchupLiveStream), the same way
-          // GetRecordingStreamProperties returning no STREAMURL selects
-          // OpenRecordedStream below.
+          // Returning empty properties (bar EPGPLAYBACKASLIVE) here selects
+          // Kodi's raw OpenLiveStream/ReadLiveStream/SeekLiveStream
+          // byte-callback path instead (see NativeCatchupLiveStream), the
+          // same way GetRecordingStreamProperties returning no STREAMURL
+          // selects OpenRecordedStream below.
+          //
+          // EPGPLAYBACKASLIVE=true is required here: without it Kodi tries
+          // to open the raw pvr://guide/... EPG-tag URI directly instead of
+          // falling through to the channel's stream properties/OpenLiveStream
+          // (confirmed - omitting it produced "CVideoPlayer::OpenInputStream
+          // - error opening [pvr://guide/...]" instead of ever reaching
+          // OpenLiveStream).
           const auto nowSteady = std::chrono::steady_clock::now();
           const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     nowSteady.time_since_epoch()).count();
@@ -1814,6 +1831,7 @@ public:
                 PendingNativeCatchupOpen{stream.uuid, startTime, effectiveEnd, nowMs + 30000};
           }
           (void)isOngoing;
+          properties.emplace_back(PVR_STREAM_PROPERTY_EPGPLAYBACKASLIVE, "true");
           return PVR_ERROR_NO_ERROR;
         }
 

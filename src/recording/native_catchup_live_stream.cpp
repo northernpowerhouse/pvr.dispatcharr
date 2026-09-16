@@ -2,6 +2,8 @@
 
 #include "../dispatcharr_client.h"
 
+#include <kodi/General.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +55,9 @@ bool NativeCatchupLiveStream::Open(const std::string& channelUuid, time_t progra
   m_position = 0;
   m_length = totalLength;
   m_open = true;
+  kodi::Log(ADDON_LOG_INFO,
+            "pvr.dispatcharr: NativeCatchupLiveStream::Open session=%s totalLength=%lld bytesPerSecond=%.1f",
+            m_sessionId.c_str(), static_cast<long long>(totalLength), m_bytesPerSecond);
   return true;
 }
 
@@ -82,7 +87,12 @@ bool NativeCatchupLiveStream::EnsureSessionNear(time_t wallClockTarget, int64_t 
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_sessionId.empty() &&
         std::abs(static_cast<long long>(wallClockTarget - m_sessionAnchorWallClock)) <= kReanchorThresholdSeconds)
+    {
+      kodi::Log(ADDON_LOG_DEBUG,
+                "pvr.dispatcharr: NativeCatchupLiveStream::EnsureSessionNear absorbed (within threshold), keeping session=%s",
+                m_sessionId.c_str());
       return true;
+    }
     channelUuid = m_channelUuid;
     programStart = m_programStart;
     programEnd = m_programEnd;
@@ -98,6 +108,10 @@ bool NativeCatchupLiveStream::EnsureSessionNear(time_t wallClockTarget, int64_t 
   dispatcharr::CatchupSession session;
   if (!m_client.CreateCatchupSession(channelUuid, clampedTarget, durationMinutes, session))
     return false;
+
+  kodi::Log(ADDON_LOG_INFO,
+            "pvr.dispatcharr: NativeCatchupLiveStream re-anchoring: newSession=%s wallClockTarget=%lld bytePos=%lld",
+            session.sessionId.c_str(), static_cast<long long>(clampedTarget), static_cast<long long>(logicalBytePos));
 
   std::lock_guard<std::mutex> lock(m_mutex);
   m_sessionId = session.sessionId;
