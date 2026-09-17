@@ -101,11 +101,19 @@ struct EpgProgram
 // just observed in Kodi: a repeated identical `start` and a `start` 40
 // minutes later both returned byte-identical content on the same
 // session_id. The only thing that reliably re-anchors is a genuinely new
-// session via CreateCatchupSession. See NativeCatchupLiveStream
-// (src/recording/native_catchup_live_stream.h) for the addon-managed seek
-// path this drives: it mints a fresh session per real seek and serves it
-// through Kodi's OpenLiveStream/ReadLiveStream/SeekLiveStream byte-callback
-// interface instead of a client-side URL.
+// session via CreateCatchupSession.
+//
+// An addon-managed seek path built on this (minting a fresh session per
+// real seek and serving it through Kodi's raw OpenLiveStream/ReadLiveStream/
+// SeekLiveStream byte-callback interface) was built and tested - see git
+// history around commit e86093f, "Native catchup: addon-managed seeking via
+// OpenLiveStream, not ffmpegdirect" - but Kodi's JSON-RPC/CVideoPlayer layer
+// kept reporting canseek:false/live:true regardless of what the addon's own
+// CanSeekStream()/IsRealTimeStream() overrides returned, for reasons inside
+// Kodi's own player state rather than anything addon-controlled. Catchup
+// currently falls back to the Xtream-compat URL-reopen path unconditionally
+// (see GetEPGTagStreamProperties in addon.cpp) even when api_mode is
+// "native"; these session methods remain unused by the addon for now.
 struct CatchupSession
 {
   std::string sessionId;

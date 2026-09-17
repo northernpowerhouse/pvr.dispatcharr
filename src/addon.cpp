@@ -24,7 +24,6 @@
 #include "dispatcharr_client.h"
 #include "recording/growing_recorded_stream.h"
 #include "recording/remote_file_recorded_stream.h"
-#include "recording/native_catchup_live_stream.h"
 #include "recording/epg_recording_match.h"
 
 // Platform-specific time functions
@@ -538,13 +537,7 @@ public:
     // EPG support via XMLTV from Xtream Codes server
     capabilities.SetSupportsEPG(true);
 
-    // Regular live/recording playback provides a STREAMURL and lets Kodi
-    // handle it as usual. This capability only additionally enables
-    // OpenLiveStream/ReadLiveStream/SeekLiveStream/LengthLiveStream as an
-    // opt-in per-stream alternative - selected only for native catchup (see
-    // GetEPGTagStreamProperties/GetChannelStreamProperties), which returns
-    // no STREAMURL specifically to route into that path instead.
-    capabilities.SetHandlesInputStream(true);
+    capabilities.SetHandlesInputStream(false);
 
     // DVR/Recording support via Dispatcharr backend
     capabilities.SetSupportsRecordings(true);
@@ -1313,22 +1306,6 @@ public:
       const auto now = std::chrono::steady_clock::now();
       const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 
-      // A pending native catchup open (stashed by GetEPGTagStreamProperties)
-      // selects Kodi's raw OpenLiveStream/ReadLiveStream/SeekLiveStream path:
-      // return no STREAMURL and leave the entry for OpenLiveStream to
-      // consume. ISREALTIMESTREAM=false is required here (confirmed - Kodi
-      // refused Player.Seek with -32100 "Failed to execute method" and never
-      // even reached SeekLiveStream when it was omitted, despite
-      // CanSeekStream() returning true): it's apparently the signal Kodi
-      // uses to allow seeking on a channel-based open at all, separate from
-      // the CanSeekStream()/IsRealTimeStream() overrides.
-      const auto nativeIt = m_pendingNativeCatchupOpenByChannel.find(channelUid);
-      if (nativeIt != m_pendingNativeCatchupOpenByChannel.end() && nativeIt->second.expiresAtMs >= nowMs)
-      {
-        properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
-        return PVR_ERROR_NO_ERROR;
-      }
-
       uidToStream = m_uidToStreamId;
       streams = m_streams;
       settings = m_xtreamSettings;
@@ -1609,30 +1586,15 @@ public:
   bool CanSeekStream() override
   {
     if (m_activeRecordedStream && m_activeRecordedStream->IsOpen())
-    {
-      kodi::Log(ADDON_LOG_DEBUG, "CanSeekStream: true (activeRecordedStream)");
       return true;
-    }
-    if (m_activeNativeLiveCatchupStream && m_activeNativeLiveCatchupStream->IsOpen())
-    {
-      kodi::Log(ADDON_LOG_DEBUG, "CanSeekStream: true (activeNativeLiveCatchupStream)");
-      return true;
-    }
     // Catchup streams support seeking via HTTP range requests
     std::lock_guard<std::mutex> lock(m_mutex);
-    const bool result = m_activeCatchupChannelUid != 0 && m_activeCatchup.programStart > 0;
-    kodi::Log(ADDON_LOG_DEBUG,
-              "CanSeekStream: %s (fallback; activeNativeLiveCatchupStream=%p activeRecordedStream=%p)",
-              result ? "true" : "false",
-              static_cast<void*>(m_activeNativeLiveCatchupStream.get()),
-              static_cast<void*>(m_activeRecordedStream.get()));
-    return result;
+    return m_activeCatchupChannelUid != 0 && m_activeCatchup.programStart > 0;
   }
 
   bool CanPauseStream() override
   {
-    return (m_activeRecordedStream && m_activeRecordedStream->IsOpen()) ||
-           (m_activeNativeLiveCatchupStream && m_activeNativeLiveCatchupStream->IsOpen());
+    return m_activeRecordedStream && m_activeRecordedStream->IsOpen();
   }
 
   void PauseStream(bool paused) override
@@ -1644,16 +1606,9 @@ public:
   {
     if (m_activeRecordedStream && m_activeRecordedStream->IsOpen())
       return false;
-    if (m_activeNativeLiveCatchupStream && m_activeNativeLiveCatchupStream->IsOpen())
-    {
-      kodi::Log(ADDON_LOG_DEBUG, "IsRealTimeStream: false (activeNativeLiveCatchupStream)");
-      return false;
-    }
     // When playing catchup, this is NOT a realtime stream
     std::lock_guard<std::mutex> lock(m_mutex);
-    const bool result = m_activeCatchupChannelUid == 0;
-    kodi::Log(ADDON_LOG_DEBUG, "IsRealTimeStream: %s (fallback)", result ? "true" : "false");
-    return result;
+    return m_activeCatchupChannelUid == 0;
   }
 
   PVR_ERROR GetStreamTimes(kodi::addon::PVRStreamTimes& times) override
@@ -1695,82 +1650,12 @@ public:
     return PVR_ERROR_NOT_IMPLEMENTED;
   }
 
-  // Only ever selected for native catchup - see the "pending native catchup
-  // open" checks in GetChannelStreamProperties/GetEPGTagStreamProperties
-  // above. Regular live channel playback (any api_mode) always returns a
-  // STREAMURL and never reaches OpenLiveStream/ReadLiveStream/SeekLiveStream/
-  // LengthLiveStream at all.
-  bool OpenLiveStream(const kodi::addon::PVRChannel& channel) override
-  {
-    PendingNativeCatchupOpen pending;
-    bool hasPending = false;
-    std::shared_ptr<dispatcharr::Client> dispatchClient;
-    {
-      std::lock_guard<std::mutex> lock(m_mutex);
-      const unsigned int channelUid = channel.GetUniqueId();
-      const auto now = std::chrono::steady_clock::now();
-      const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-      auto it = m_pendingNativeCatchupOpenByChannel.find(channelUid);
-      if (it != m_pendingNativeCatchupOpenByChannel.end())
-      {
-        if (it->second.expiresAtMs >= nowMs)
-        {
-          pending = it->second;
-          hasPending = true;
-        }
-        m_pendingNativeCatchupOpenByChannel.erase(it);
-      }
-      dispatchClient = m_dispatcharrClient;
-    }
-
-    if (!hasPending || !dispatchClient)
-    {
-      kodi::Log(ADDON_LOG_WARNING, "OpenLiveStream: called with no pending native catchup open for channel %u",
-                channel.GetUniqueId());
-      return false;
-    }
-
-    kodi::Log(ADDON_LOG_INFO, "OpenLiveStream: opening native catchup uuid=%s start=%ld end=%ld",
-              pending.channelUuid.c_str(), pending.programStart, pending.programEnd);
-
-    auto stream = std::make_unique<dispatcharr::recording::NativeCatchupLiveStream>(*dispatchClient);
-    if (!stream->Open(pending.channelUuid, pending.programStart, pending.programEnd))
-    {
-      kodi::Log(ADDON_LOG_ERROR, "OpenLiveStream: NativeCatchupLiveStream::Open failed");
-      return false;
-    }
-
-    m_activeNativeLiveCatchupStream = std::move(stream);
-    return true;
-  }
-
   void CloseLiveStream() override
   {
-    if (m_activeNativeLiveCatchupStream)
-    {
-      m_activeNativeLiveCatchupStream->Close();
-      m_activeNativeLiveCatchupStream.reset();
-    }
     std::lock_guard<std::mutex> lock(m_mutex);
     // Clear all active stream state that may differ between channels
     m_activeCatchup = PendingCatchup{};
     m_activeCatchupChannelUid = 0;
-    kodi::Log(ADDON_LOG_DEBUG, "CloseLiveStream: cleared active stream state");
-  }
-
-  int ReadLiveStream(unsigned char* buffer, unsigned int size) override
-  {
-    return m_activeNativeLiveCatchupStream ? m_activeNativeLiveCatchupStream->Read(buffer, size) : -1;
-  }
-
-  int64_t SeekLiveStream(int64_t position, int whence) override
-  {
-    return m_activeNativeLiveCatchupStream ? m_activeNativeLiveCatchupStream->Seek(position, whence) : -1;
-  }
-
-  int64_t LengthLiveStream() override
-  {
-    return m_activeNativeLiveCatchupStream ? m_activeNativeLiveCatchupStream->Length() : -1;
   }
 
   PVR_ERROR GetEPGTagStreamProperties(const kodi::addon::PVREPGTag& tag,
@@ -1822,45 +1707,32 @@ public:
         const bool isOngoing = (endTime > nowTs);
         const time_t effectiveEnd = isOngoing ? nowTs : endTime;
 
-        if (settings.apiMode == "native")
-        {
-          if (stream.uuid.empty())
-            return PVR_ERROR_UNKNOWN;
-
-          // Deliberately return no STREAMURL and no ffmpegdirect properties.
-          // Confirmed directly against the server (not just observed in
-          // Kodi) that neither a plain Range-seek on one session nor
-          // ffmpegdirect's reopen-with-a-new-`start` on one session actually
-          // moves playback - the server always keeps serving the original
-          // bind position. The only thing that reliably re-anchors is a
-          // genuinely new session per seek, which requires an addon-side API
-          // call ffmpegdirect's client-side URL substitution can't make.
-          // Returning empty properties (bar EPGPLAYBACKASLIVE) here selects
-          // Kodi's raw OpenLiveStream/ReadLiveStream/SeekLiveStream
-          // byte-callback path instead (see NativeCatchupLiveStream), the
-          // same way GetRecordingStreamProperties returning no STREAMURL
-          // selects OpenRecordedStream below.
-          //
-          // EPGPLAYBACKASLIVE=true is required here: without it Kodi tries
-          // to open the raw pvr://guide/... EPG-tag URI directly instead of
-          // falling through to the channel's stream properties/OpenLiveStream
-          // (confirmed - omitting it produced "CVideoPlayer::OpenInputStream
-          // - error opening [pvr://guide/...]" instead of ever reaching
-          // OpenLiveStream).
-          const auto nowSteady = std::chrono::steady_clock::now();
-          const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    nowSteady.time_since_epoch()).count();
-          {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_pendingNativeCatchupOpenByChannel[channelUid] =
-                PendingNativeCatchupOpen{stream.uuid, startTime, effectiveEnd, nowMs + 30000};
-          }
-          (void)isOngoing;
-          properties.emplace_back(PVR_STREAM_PROPERTY_EPGPLAYBACKASLIVE, "true");
-          properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
-          return PVR_ERROR_NO_ERROR;
-        }
-
+        // Catchup always goes through the Xtream-compat URL-reopen path,
+        // even when api_mode is "native" for channels/EPG/live. Dispatcharr's
+        // native catchup API (POST /api/catchup/sessions/) binds `start` to
+        // a session_id at creation time and ignores it on later requests
+        // against the same session_id - confirmed directly against the
+        // server with curl, not just observed in Kodi. That leaves no
+        // client-drivable way to seek by reopening a URL, which is the only
+        // seek mechanism Kodi's inputstream.ffmpegdirect (and this addon's
+        // STREAMURL-based flow) has. An addon-managed session-per-seek
+        // approach was built and tested (see git history around commit
+        // e86093f, "Native catchup: addon-managed seeking via
+        // OpenLiveStream, not ffmpegdirect") using Kodi's raw
+        // OpenLiveStream/ReadLiveStream/SeekLiveStream byte-callback
+        // interface, but Kodi's JSON-RPC/CVideoPlayer layer reported
+        // canseek:false/live:true regardless, and the root
+        // cause is inside Kodi's own internal player state rather than
+        // anything this addon controls. Falling back to the Xtream-compat
+        // catchup endpoint sidesteps this entirely: it supports genuine
+        // server-side scrubbing on URL-reopen (see
+        // dispatcharr_client.h's CatchupSession comment), which is exactly
+        // what ffmpegdirect's catchup_url_format_string relies on. The
+        // channel id used below (stream.id) is Dispatcharr's internal
+        // channel id in both api_modes - FetchNativeCategoriesAndStreams
+        // sets it from DispatchChannel::id, the same id space the
+        // Xtream-compat layer serves from - so this works unmodified as
+        // long as valid Xtream credentials are configured.
         const std::string url = xtream::BuildCatchupUrl(settings, stream.id, startTime, effectiveEnd, streamFormat);
         kodi::Log(ADDON_LOG_INFO, "GetEPGTagStreamProperties: catchup URL = %s, isOngoing=%d", url.c_str(), isOngoing);
         
@@ -3076,7 +2948,6 @@ private:
   // a settings reload replaces m_dispatcharrClient concurrently.
   std::shared_ptr<dispatcharr::Client> m_dispatcharrClient;
   std::unique_ptr<dispatcharr::recording::IRecordedStream> m_activeRecordedStream;
-  std::unique_ptr<dispatcharr::recording::NativeCatchupLiveStream> m_activeNativeLiveCatchupStream;
   std::string m_streamFormat;
   std::string m_channelNumbering;
   std::string m_filterPatternsRaw;
@@ -3107,19 +2978,6 @@ private:
     bool useFFmpegDirect = false;
   };
   std::unordered_map<unsigned int, PendingCatchup> m_pendingCatchupByChannel;
-
-  // Native catchup: set by GetEPGTagStreamProperties (native api_mode),
-  // consumed by OpenLiveStream. Unlike PendingCatchup above, this selects
-  // Kodi's raw OpenLiveStream/ReadLiveStream/SeekLiveStream byte-callback
-  // path (no STREAMURL at all) - see NativeCatchupLiveStream for why.
-  struct PendingNativeCatchupOpen
-  {
-    std::string channelUuid;
-    time_t programStart = 0;
-    time_t programEnd = 0;
-    int64_t expiresAtMs = 0;
-  };
-  std::unordered_map<unsigned int, PendingNativeCatchupOpen> m_pendingNativeCatchupOpenByChannel;
 
   // Active catchup playback - persists during playback for GetStreamTimes/CanSeekStream/IsRealTimeStream
   PendingCatchup m_activeCatchup;
